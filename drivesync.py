@@ -3,6 +3,7 @@ import io
 import atexit
 import sched
 import httplib2
+import webbrowser
 import configparser
 
 from apiclient import discovery
@@ -16,96 +17,147 @@ try:
 except ImportError:
     flags = None
 
+class Configuration:
+    def __init__(self, configurationDirectory):
+        self.sectionName = 'DEFAULT'
+        self.configuration = configparser.ConfigParser()
+        self.configurationFile = os.path.join(configurationDirectory, 'configuration.ini')
+        # Writing default configuration file
+        if not os.path.exists(self.configurationFile):
+            self.configuration[self.sectionName] = {
+                'drive-directory': "~/DriveSync",
+                'sync-interval-seconds': 120
+            }
+
+    def __contains__(object, index):
+        return index in object.configuration[object.sectionName]
+
+    def __getitem__(object, index):
+        return object.configuration[object.sectionName][index]
+
+    def __setitem__(object, index, value):
+        object.configuration[object.sectionName][index] = value
+
+    def saveConfiguration(self):
+        with open(str(self.configurationFile), 'w') as fileWriter:
+            self.configuration.write(fileWriter)
+            print('Wrote default configuration file on ' + self.configurationFile)
+
+    def readConfiguration(self):
+        self.configuration.read(self.configurationFile)
 
 class DriveSync:
     def __init__(self):
-        self.home_directory = os.path.expanduser('~')
-        self.drivesync_config_directory = os.path.join(self.home_directory, '.drivesync')
+        self.homeDirectory = os.path.expanduser('~')
+        self.configurationDirectory = os.path.join(self.homeDirectory, '.drivesync')
 
         # Creating app directory if it doesn't exists
-        if not os.path.exists(self.drivesync_config_directory):
-            os.makedirs(self.drivesync_config_directory)
-            print('Created DriveSync configuration folder on ' + self.drivesync_config_directory)
+        if not os.path.exists(self.configurationDirectory):
+            os.makedirs(self.configurationDirectory)
+            print('Created DriveSync configuration folder on ' + self.configurationDirectory)
 
-        self.configuration = configparser.ConfigParser()
-        self.configuration_file = os.path.join(self.drivesync_config_directory, 'configuration.ini')
-        # Writing default configuration file
-        if not os.path.exists(self.configuration_file):
-            self.configuration['DEFAULT'] = {
-                'drive-directory': '' + os.path.join(self.home_directory, 'DriveSync'),
-                'sync-interval-seconds': 120
-            }
-            with open(str(self.configuration_file), 'w') as file_writer:
-                self.configuration.write(file_writer)
-                print('Wrote default configuration file on ' + self.configuration_file)
-
-        # Reading configuration file
-        self.configuration.read(self.configuration_file)
-        self.drivesync_directory = os.path.expanduser(self.configuration['DRIVESYNC']['drive-directory'])
+        self.configuration = Configuration(self.configurationDirectory)
+        self.drivesyncDirectory = os.path.expanduser(self.configuration['drive-directory'])
 
         # Searching DriveSync directory
-        if not os.path.exists(self.drivesync_directory):
-            os.makedirs(self.drivesync_directory)
-            print('Created DriveSync directory on ' + self.drivesync_directory)
+        if not os.path.exists(self.drivesyncDirectory):
+            os.makedirs(self.drivesyncDirectory)
+            print('Created DriveSync directory on ' + self.drivesyncDirectory)
         else:
-            print('Using ' + self.drivesync_directory + ' as DriveSync folder')
+            print('Using ' + self.drivesyncDirectory + ' as DriveSync folder')
 
-        # Starting Google service => this will ask for credentials
-        http_service = self.get_credentials().authorize(httplib2.Http())
-        self.google_service = discovery.build('drive', 'v3', http=http_service)
-
-        atexit.register(self.stop_sync_task)
-        self.sync_interval = int( self.configuration['DRIVESYNC']['sync-interval-seconds'])
+        atexit.register(self.stopSynchronizationTask)
+        self.synchronizationInterval = int( self.configuration['sync-interval-seconds'])
         # Force sync (this will register a task)
         self.scheduler = sched.scheduler()
-        self.scheduler.enter(delay=0, priority=1, action=self.sync_task)
+        self.scheduler.enter(delay=0, priority=1, action=self.doSynchronizationTask)
         try:
             print('=== DriveSync initialized!')
             self.scheduler.run(blocking=True)
         except (KeyboardInterrupt, SystemExit):
             print('Application interrupted.')
 
-    def get_credentials(self):
-        self.credential_file_path = os.path.join(self.drivesync_config_directory, 'drivesync-credentials.json')
+    def getAuthenticatedService(self):
+        self.credentialFilePath = os.path.join(self.configurationDirectory, 'drivesync-credentials.json')
 
         # Creating storage on credential file
-        store = Storage(self.credential_file_path)
-        credentials = store.get()
+        storage = Storage(self.credentialFilePath)
+        credentials = storage.get()
         if not credentials or credentials.invalid:
             # Enable the API through developer id, asking for all privileges
-            flow = client.flow_from_clientsecrets('client_id.json', 'https://www.googleapis.com/auth/drive')
-            flow.user_agent = 'DriveSync'
+            flow = client.flow_from_clientsecrets('client_secret.json', scope='https://www.googleapis.com/auth/drive')
+            flow.user_agent = 'drive-sync-id'
 
             # Running permissions on Google
             if flags:
-                credentials = tools.run_flow(flow, store, flags)
+                credentials = tools.run_flow(flow, storage, flags)
             else: # Needed only for compatibility with Python 2.6
-                credentials = tools.run(flow, store)
+                credentials = tools.run(flow, storage)
 
             # Printing success
-            print('Storing Google credentials on ' + self.credential_file_path)
-        return credentials
+            print('Stored Google credentials on ' + self.credentialFilePath)
 
-    def stop_sync_task(self):
+        # Create and return service
+        http = credentials.authorize(httplib2.Http())
+        return (discovery.build('drive', 'v3', http=http), http)
+
+    def stopSynchronizationTask(self):
         # This will auto-trigger on exit
-        print('Stopped sync thread')
+        print('Stopped synchronization thread')
 
-    def sync_task(self):
+    def doSynchronizationTask(self):
         print('-> Synchronizing...')
-        something_changed = False
+        somethingChanged = False
 
+        idIndex = {}
+        parentFileDict = {}
+        pageToken = None
+        while True:
+            googleService, http = self.getAuthenticatedService()
+            response = googleService.files().list(q="mimeType == 'application/vnd.google-apps.folder' and not trashed",
+                                                 spaces='drive',
+                                                 fields='nextPageToken, files(id, name, mimeType, parents)',
+                                                 pageToken=pageToken).execute(http=http)
+            for file in response.get('files', []):
+                driveFile = DriveFile(file)
 
+                idIndex[driveFile.id] = driveFile
 
-        if something_changed:
+                if driveFile.parent not in parentFileDict:
+                    parentFileDict[driveFile.parent] = [driveFile]
+                else:
+                    parentFileDict[driveFile.parent] += [driveFile]
+            pageToken = response.get('nextPageToken', None)
+            if pageToken is None:
+                break;
+
+        for parent, fileList in parentFileDict.items():
+            print(idIndex[parent].name + ': ' + str(fileList))
+
+        if somethingChanged:
             print('-> Synchronized with Google Drive!')
         else:
-            print('-> Nothing changed.')
+                print('-> Nothing changed.')
+
         # Repeat task
-        self.scheduler.enter(delay=self.sync_interval, priority=1, action=self.sync_task)
+        self.scheduler.enter(delay=self.synchronizationInterval, priority=1, action=self.doSynchronizationTask)
+
+class DriveFile:
+    def __init__(self, file):
+        self.id = file.get('id')
+        self.name = file.get('name')
+        self.type = file.get('mimeType'),
+        self.parent = file.get('parents', ['unknown'])[0]
+
+    def __str__(self):
+        return self.fileName
+
+    def __iter__(self):
+        return [self.id, self.name]
 
 def main():
     print("=== DriveSync v0.1, by Rafael 'jabyftw' Santos ===")
-    drive_sync = DriveSync()
+    driveSync = DriveSync()
 
 if __name__ == '__main__':
     main()
